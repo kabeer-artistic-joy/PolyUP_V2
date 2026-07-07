@@ -16,7 +16,7 @@ project, not speculative ideas layered back in:
     just enough to actually get filled.
   - Sell mechanics reuse the proven resting-order pattern: instantly rest a
     sell at entry + PROFIT_MARGIN the moment a buy confirms, force-exit if
-    unfilled after TRADE_AGE_CAP_SECONDS.
+    bracket order (take-profit and stop-loss placed simultaneously) — the ultimate backstop is BRACKET_TIMEOUT_SECONDS.
   - Whole-share flooring, the balance-safety fallback, and the crash-safety
     None-price guard are all carried over unchanged.
 
@@ -68,10 +68,12 @@ BUY_CEILING_BUFFER = 0.02        # willing to pay up to (observed price + this) 
                                   # at $0.80, not just near $0.50.
 BUY_TIMEOUT_SEC    = 2.0
 
-PROFIT_MARGIN      = 0.10        # raised from $0.02 — wide enough to clear the bid-ask spread that was
-                                    # eating the thin margin regardless of direction
-TRADE_AGE_CAP_SECONDS = 20        # raised from 5s — gives real momentum more time to develop before forcing
-                                    # an exit at whatever the spread happens to be at that instant
+PROFIT_MARGIN      = 0.15        # take-profit target — raised to 0.15 per explicit request, aiming to win
+                                    # big and lose small rather than a thin, spread-vulnerable margin
+STOP_LOSS_MARGIN   = 0.02        # controlled loss cap — if price moves against the position, exit here
+                                    # instead of riding it down further
+BRACKET_TIMEOUT_SECONDS = 60     # ultimate backstop only — if NEITHER bracket level is reached this long
+                                    # after buying, force-exit at whatever price is available
 
 MAX_TRADES_PER_WINDOW = 8        # raised from 6 per explicit request
 MONITOR_INTERVAL      = 1.0      # how often to check for a new entry opportunity throughout the window
@@ -227,7 +229,8 @@ class BreakthroughBot:
         log(f"Direction: delta-from-price-to-beat only (min {MIN_DELTA_PCT_TO_TRUST}% to trust)"
             + (" | ⚠️ INVERT_SIGNAL=True — betting AGAINST the delta signal (test mode)" if INVERT_SIGNAL else ""))
         log(f"Buy: observed price + ${BUY_CEILING_BUFFER} buffer (no fixed ceiling) | timeout {BUY_TIMEOUT_SEC}s")
-        log(f"Sell: entry + ${PROFIT_MARGIN} | force-exit after {TRADE_AGE_CAP_SECONDS}s unfilled | "
+        log(f"Sell: bracket order — take-profit entry+${PROFIT_MARGIN} | stop-loss entry-${STOP_LOSS_MARGIN} | "
+            f"backstop timeout {BRACKET_TIMEOUT_SECONDS}s | "
             f"max {MAX_TRADES_PER_WINDOW} trades/window")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
@@ -325,8 +328,15 @@ class BreakthroughBot:
             pnl = -round(buy_price * raw_shares, 4)
             return {**exit_result, "pnl_usd": pnl, "notes": "sub-1-share partial fill"}
 
-        sell_trigger = round(buy_price + PROFIT_MARGIN, 4)
-        log(f"Sell trigger: ${sell_trigger} (bought ${buy_price} + ${PROFIT_MARGIN})", crypto)
+        # BRACKET ORDER: take-profit and stop-loss placed at the same time,
+        # right after buying. Whichever the price reaches first determines
+        # the outcome — a real win capped losses, or a small, controlled
+        # loss if the market moves the other way. This replaces the old
+        # single-target + blind-timeout design.
+        take_profit_price = round(buy_price + PROFIT_MARGIN, 4)
+        stop_loss_price   = round(buy_price - STOP_LOSS_MARGIN, 4)
+        log(f"Bracket: take-profit ${take_profit_price} (+${PROFIT_MARGIN}) | "
+            f"stop-loss ${stop_loss_price} (-${STOP_LOSS_MARGIN})", crypto)
         buy_time = now_unix()
 
         if not self.dry_run:
@@ -340,68 +350,98 @@ class BreakthroughBot:
                 log(f"⚠️ Could not sync conditional balance ({e})", crypto)
 
             from py_clob_client_v2 import OrderArgsV2, Side, OrderType, OrderPayload
+            tp_order_id, sl_order_id = None, None
             try:
-                resp = self.client.create_and_post_order(
-                    OrderArgsV2(token_id=token, price=sell_trigger, size=shares, side=Side.SELL),
+                tp_resp = self.client.create_and_post_order(
+                    OrderArgsV2(token_id=token, price=take_profit_price, size=shares, side=Side.SELL),
                     order_type=OrderType.GTC,
                 )
-                sell_order_id = resp.get("orderID", "")
-                log(f"Resting SELL placed at ${sell_trigger}, order {sell_order_id[:16]}...", crypto)
+                tp_order_id = tp_resp.get("orderID", "")
+                sl_resp = self.client.create_and_post_order(
+                    OrderArgsV2(token_id=token, price=stop_loss_price, size=shares, side=Side.SELL),
+                    order_type=OrderType.GTC,
+                )
+                sl_order_id = sl_resp.get("orderID", "")
+                log(f"Bracket orders placed: TP {tp_order_id[:12]}... | SL {sl_order_id[:12]}...", crypto)
             except Exception as e:
-                log(f"⚠️ Could not place resting sell ({e}) — forcing exit immediately", crypto)
+                log(f"⚠️ Could not place bracket orders ({e}) — forcing exit immediately", crypto)
+                # NOTE: a real, honest risk here — if ONE of the two orders placed
+                # successfully before the other failed, that order is still live
+                # on the book. Cancel both defensively before force-exiting.
+                for oid in (tp_order_id, sl_order_id):
+                    if oid:
+                        try:
+                            self.client.cancel_order(OrderPayload(orderID=oid))
+                        except Exception:
+                            pass
                 exit_result = self._force_exit(token, shares, crypto)
                 pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-                return {**exit_result, "pnl_usd": pnl, "notes": "resting sell placement failed"}
+                return {**exit_result, "pnl_usd": pnl, "notes": "bracket placement failed"}
 
-            last_known_sold = 0.0
-            while now_unix() - buy_time < TRADE_AGE_CAP_SECONDS:
-                try:
-                    detail = self.client.get_order(sell_order_id)
-                except Exception:
-                    detail = None
-                if detail is None:
-                    last_known_sold = shares
-                    break
-                try:
-                    current_sold = float(detail.get("size_matched", 0))
-                    if current_sold > last_known_sold:
-                        last_known_sold = current_sold
-                except (TypeError, ValueError):
-                    pass
+            # Poll BOTH orders. Whichever fills first, cancel the other
+            # immediately. NOTE: an honest, real limitation of polling (vs a
+            # websocket feed) — there is a small window where both orders
+            # could theoretically get partial fills before we detect either
+            # and cancel the other. This has not been ruled out and is worth
+            # watching for in real fill data.
+            deadline = buy_time + BRACKET_TIMEOUT_SECONDS
+            while now_unix() < deadline:
+                for label, oid, price in (("take_profit", tp_order_id, take_profit_price),
+                                           ("stop_loss", sl_order_id, stop_loss_price)):
+                    try:
+                        detail = self.client.get_order(oid)
+                    except Exception:
+                        detail = None
+                    if detail is None:
+                        continue
+                    try:
+                        filled = float(detail.get("size_matched", 0))
+                    except (TypeError, ValueError):
+                        filled = 0
+                    if filled >= shares:
+                        other_id = sl_order_id if label == "take_profit" else tp_order_id
+                        try:
+                            self.client.cancel_order(OrderPayload(orderID=other_id))
+                        except Exception:
+                            pass
+                        pnl = round((price - buy_price) * shares, 4)
+                        return {"result": f"sold_{label}", "price": price, "pnl_usd": pnl,
+                                "notes": f"{label} hit"}
                 time.sleep(POLL_INTERVAL_SLOW)
 
-            if last_known_sold >= shares:
-                pnl = round((sell_trigger - buy_price) * shares, 4)
-                return {"result": "sold", "price": sell_trigger, "pnl_usd": pnl, "notes": "sold via resting order"}
-
-            try:
-                self.client.cancel_order(OrderPayload(orderID=sell_order_id))
-            except Exception:
-                pass
-            remaining = round(shares - last_known_sold, 4)
-            if remaining < 1:
-                pnl = round((sell_trigger - buy_price) * last_known_sold, 4)
-                return {"result": "sold", "price": sell_trigger, "pnl_usd": pnl, "notes": "dust remainder left"}
-            exit_result = self._force_exit(token, int(remaining), crypto)
-            sold_pnl = round((sell_trigger - buy_price) * last_known_sold, 4)
-            exit_pnl = round((exit_result["price"] - buy_price) * int(remaining), 4) if exit_result["price"] is not None else -round(buy_price * int(remaining), 4)
-            return {**exit_result, "pnl_usd": round(sold_pnl + exit_pnl, 4), "notes": "partial via resting order + force-exit"}
+            # Neither triggered within the backstop timeout — cancel both, force-exit
+            for oid in (tp_order_id, sl_order_id):
+                try:
+                    self.client.cancel_order(OrderPayload(orderID=oid))
+                except Exception:
+                    pass
+            log(f"⏰ Neither bracket order filled within {BRACKET_TIMEOUT_SECONDS}s — force-exiting", crypto)
+            exit_result = self._force_exit(token, shares, crypto)
+            pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
+            return {**exit_result, "pnl_usd": pnl, "notes": "bracket timeout, force-exit"}
 
         # DRY-RUN
-        while now_unix() - buy_time < TRADE_AGE_CAP_SECONDS:
+        while now_unix() - buy_time < BRACKET_TIMEOUT_SECONDS:
             book = get_order_book(token)
-            price, size = best_bid(book)
-            if price is not None and price >= sell_trigger and size >= shares:
+            bid_price, bid_size = best_bid(book)
+            if bid_price is not None and bid_size >= shares:
                 elapsed = round(now_unix() - buy_time, 1)
-                log(f"[DRY] SELL would fill: bid ${price:.3f} at {elapsed}s", crypto)
-                pnl = round((price - buy_price) * shares, 4)
-                return {"result": "sold", "price": price, "pnl_usd": pnl, "notes": "sold", "seconds_to_sell": elapsed}
+                if bid_price >= take_profit_price:
+                    log(f"[DRY] Take-profit hit: bid ${bid_price:.3f} at {elapsed}s", crypto)
+                    pnl = round((take_profit_price - buy_price) * shares, 4)
+                    return {"result": "sold_take_profit", "price": take_profit_price, "pnl_usd": pnl,
+                            "notes": "take_profit hit", "seconds_to_sell": elapsed}
+                elif bid_price <= stop_loss_price:
+                    log(f"[DRY] Stop-loss hit: bid ${bid_price:.3f} at {elapsed}s", crypto)
+                    pnl = round((stop_loss_price - buy_price) * shares, 4)
+                    return {"result": "sold_stop_loss", "price": stop_loss_price, "pnl_usd": pnl,
+                            "notes": "stop_loss hit", "seconds_to_sell": elapsed}
             time.sleep(POLL_INTERVAL_SLOW)
 
-        log(f"⏰ {TRADE_AGE_CAP_SECONDS}s unfilled — force-exiting at best price", crypto)
+        log(f"⏰ Neither bracket level reached within {BRACKET_TIMEOUT_SECONDS}s — force-exiting at best price", crypto)
         exit_result = self._force_exit(token, shares, crypto)
         pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-        return {**exit_result, "pnl_usd": pnl, "notes": "force-exit", "seconds_to_sell": TRADE_AGE_CAP_SECONDS}
+        return {**exit_result, "pnl_usd": pnl, "notes": "bracket timeout, force-exit", "seconds_to_sell": BRACKET_TIMEOUT_SECONDS}
 
     def _force_exit(self, token: str, shares: float, crypto: str) -> dict:
         if self.dry_run:
@@ -553,12 +593,14 @@ class BreakthroughBot:
     def _print_summary(self):
         with self.trades_lock:
             trades = list(self.trades)
-        bought = [t for t in trades if t["buy_result"] == "bought"]
-        sold   = [t for t in bought if t["sell_result"] == "sold"]
+        bought      = [t for t in trades if t["buy_result"] == "bought"]
+        take_profit = [t for t in bought if t["sell_result"] == "sold_take_profit"]
+        stop_loss   = [t for t in bought if t["sell_result"] == "sold_stop_loss"]
         total_pnl = sum(float(t["pnl_usd"] or 0) for t in trades)
         log("-" * 70)
         log(f"SUMMARY — {len(trades)} signals, {len(bought)} buy fills")
-        log(f"  Sold at margin: {len(sold)}")
+        log(f"  Take-profit hits: {len(take_profit)}")
+        log(f"  Stop-loss hits: {len(stop_loss)}")
         log(f"  Total PnL: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
         log("-" * 70)
 
