@@ -1,32 +1,39 @@
 #!/usr/bin/env python3
 """
-Polymarket Trailing-Consistency Up Scalper
-============================================
-Always buys UP, same as the original Always-Up bot — but instead of entering
-every single window, it wakes CONSISTENCY_WINDOW_SEC before the CURRENT
-window closes and checks one thing: is BTC's price, measured against the
-CURRENT window's own price-to-beat, still trending up in that final
-stretch? If yes, buy Up the instant the new window opens. If not, skip
-this window entirely.
+Polymarket Rapid Momentum Scalper — Final Combined Bot
+========================================================
+Built using only the pieces that have actually proven out across this whole
+project, not speculative ideas layered back in:
 
-An earlier version of this bot also used a market-sentiment check (counting
-price reversals over a longer lookback) — that was tested, found not to work
-as intended (its threshold was unreachable given real data), and removed
-entirely per explicit decision. This version tests the trailing consistency
-check on its own.
+  - Direction is decided SOLELY by delta-from-price-to-beat (BTC's real price
+    vs the current window's own open) — this was the one genuine fix that
+    corrected a real, confirmed flaw in an earlier bot (betting on a small
+    local wiggle instead of the bigger picture). No local-only momentum
+    signal is used here at all.
+  - Buy price is NOT capped at a fixed ceiling — this bot is explicitly meant
+    to catch momentum already in progress, which can mean buying at $0.80,
+    not just near $0.50. Ceiling is relative: observed price + small buffer,
+    just enough to actually get filled.
+  - Sell mechanics reuse the proven resting-order pattern: instantly rest a
+    sell at entry + PROFIT_MARGIN the moment a buy confirms, force-exit if
+    unfilled after TRADE_AGE_CAP_SECONDS.
+  - Whole-share flooring, the balance-safety fallback, and the crash-safety
+    None-price guard are all carried over unchanged.
 
-Buy/sell mechanics are otherwise the same as proven on the other bots:
-target $0.50, ceiling $0.52, resting sell at entry+$0.05, force-exit if
-unfilled 10 seconds after buying.
+Runs continuously throughout the ENTIRE 5-minute window (not just at open),
+watching for a real delta signal and acting on it, up to MAX_TRADES_PER_WINDOW
+times per window.
 
 IMPORTANT — read before running live:
-  This is a genuinely new, untested hypothesis about a short trailing trend
-  predicting the next window's direction. It has NOT been validated with
-  real data. Run --dry-run for a meaningful sample before ever using --live.
+  This combines proven mechanics into a new configuration (much thinner
+  margin, much shorter force-exit, no buy ceiling, more entries per window)
+  that has NOT itself been validated with real data. Each PIECE is proven;
+  this SPECIFIC COMBINATION is not. Run --dry-run for a meaningful sample
+  before ever using --live.
 
 Usage:
-  python sentiment_up_bot.py --dry-run
-  python sentiment_up_bot.py --live --amount 2
+  python breakthrough_bot.py --dry-run
+  python breakthrough_bot.py --live --amount 2
 """
 
 import time
@@ -52,20 +59,20 @@ MARKETS = {
     "btc-updown-5m": "BTC",
 }
 
-BUY_TARGET_PRICE  = 0.50
-BUY_CEILING_PRICE = 0.52
-BUY_TIMEOUT_SEC   = 3.0
-PROFIT_MARGIN     = 0.05   # sell trigger = entry price + this
-TRADE_AGE_CAP_SECONDS = 10  # force-exit if unfilled this many seconds after buying
+MIN_DELTA_PCT_TO_TRUST = 0.01   # same validated starting point from the momentum bot — filters pure noise
+                                  # (e.g. a $0.01 delta on a $60k+ asset) while still catching real moves.
+BUY_CEILING_BUFFER = 0.02        # willing to pay up to (observed price + this) — NOT a fixed cap, since this
+                                  # bot is meant to catch momentum already in progress, which can mean buying
+                                  # at $0.80, not just near $0.50.
+BUY_TIMEOUT_SEC    = 2.0
 
-# Sentiment/dip-surge analysis removed entirely per explicit decision — it wasn't
-# working as intended (real data showed its threshold was unreachable). Now
-# testing ONLY the trailing consistency check on its own.
-CONSISTENCY_WINDOW_SEC = 10    # observe this many seconds before window close
-WAKE_BEFORE_SECONDS     = CONSISTENCY_WINDOW_SEC  # wake exactly this long before close — nothing else is being measured
-SAMPLE_INTERVAL_SEC     = 1.0  # how often to sample BTC price during the observation
+PROFIT_MARGIN      = 0.02        # thin, fast capture — per explicit request
+TRADE_AGE_CAP_SECONDS = 5        # force-exit if unfilled this many seconds after buying — per explicit request
 
-POLL_INTERVAL_SLOW = 1.0
+MAX_TRADES_PER_WINDOW = 6        # per explicit request (2-6 range, using the upper bound)
+MONITOR_INTERVAL      = 1.0      # how often to check for a new entry opportunity throughout the window
+
+POLL_INTERVAL_SLOW = 0.5
 
 # ─── UTILITIES ───────────────────────────────────────────────────────────────
 
@@ -93,7 +100,7 @@ def get_binance_price(symbol: str) -> float | None:
 
 
 def get_window_open_price(symbol: str, window_ts: int) -> float | None:
-    """Fetches the real 'price to beat' for a given window — the price at the moment it opened."""
+    """Fetches the real 'price to beat' — BTC's price at the moment this window opened."""
     try:
         r = requests.get(
             f"{BINANCE_API}/api/v3/klines",
@@ -107,45 +114,6 @@ def get_window_open_price(symbol: str, window_ts: int) -> float | None:
         return None
     except Exception:
         return None
-
-
-def analyze_pre_window(symbol: str, current_window_close_ts: float, stop_event: threading.Event, crypto: str) -> dict:
-    """
-    Runs during the last WAKE_BEFORE_SECONDS of the CURRENT window, before it
-    closes, to decide whether to buy Up in the UPCOMING window. Sentiment/
-    dip-surge analysis was tested and removed per explicit decision — it
-    wasn't working as intended. This now checks ONLY the trailing trend: is
-    BTC still moving up in the final seconds before the window closes.
-    """
-    result = {"enter": False, "reason": "", "consistency_trend": None}
-
-    current_window_start_ts = int(current_window_close_ts) - 300
-    price_to_beat = get_window_open_price(symbol, current_window_start_ts)
-    if price_to_beat is None:
-        result["reason"] = "could not fetch current window's price-to-beat — skipping"
-        return result
-
-    samples = []
-    while now_unix() < current_window_close_ts:
-        if stop_event.is_set():
-            result["reason"] = "stopped during observation"
-            return result
-        price = get_binance_price(symbol)
-        if price is not None:
-            samples.append((now_unix(), price - price_to_beat))
-        time.sleep(SAMPLE_INTERVAL_SEC)
-
-    if len(samples) < 2:
-        result["reason"] = f"insufficient samples collected ({len(samples)}) — skipping"
-        return result
-
-    first_val, last_val = samples[0][1], samples[-1][1]
-    consistency_trend = "Up" if last_val > first_val else ("Down" if last_val < first_val else "Flat")
-
-    result["consistency_trend"] = consistency_trend
-    result["enter"] = (consistency_trend == "Up")
-    result["reason"] = f"trailing {CONSISTENCY_WINDOW_SEC}s trend={consistency_trend} (start {first_val:+.2f}, end {last_val:+.2f})"
-    return result
 
 
 def get_window_market(slug_prefix: str, start_ts: int) -> dict | None:
@@ -212,9 +180,9 @@ def next_window_start(now: float) -> int:
 # ─── PERSISTENT CSV LOG ──────────────────────────────────────────────────────
 
 CSV_FIELDS = [
-    "timestamp", "bot_name", "mode", "crypto", "slug",
-    "consistency_trend", "entered",
-    "buy_result", "buy_price", "buy_shares",
+    "timestamp", "bot_name", "mode", "crypto", "slug", "trade_num_this_window",
+    "delta_side", "delta_value", "delta_pct",
+    "buy_result", "buy_price", "buy_shares", "buy_elapsed_ms",
     "sell_result", "sell_price", "pnl_usd", "notes",
 ]
 
@@ -235,11 +203,11 @@ class TradeLogger:
 
 # ─── CORE BOT ────────────────────────────────────────────────────────────────
 
-class SentimentUpBot:
+class BreakthroughBot:
     def __init__(self, dry_run: bool, amount: float):
         self.dry_run  = dry_run
         self.amount   = amount
-        self.bot_name = os.getenv("BOT_NAME", "sentiment_up_bot")
+        self.bot_name = os.getenv("BOT_NAME", "breakthrough_bot")
         self.mode_str = "dry_run" if dry_run else "live"
         self.stop_event = threading.Event()
         self.trades = []
@@ -251,11 +219,11 @@ class SentimentUpBot:
             self._init_client()
 
         log("=" * 70)
-        log(f"Sentiment-Gated Up Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
-        log(f"Buy: target ${BUY_TARGET_PRICE} ceiling ${BUY_CEILING_PRICE} | Sell: entry + ${PROFIT_MARGIN} | "
-            f"force-exit after {TRADE_AGE_CAP_SECONDS}s unfilled")
-        log(f"Pre-window analysis: wake {WAKE_BEFORE_SECONDS}s before close | trailing consistency check only "
-            f"(sentiment/dip-surge analysis removed)")
+        log(f"Rapid Momentum Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
+        log(f"Direction: delta-from-price-to-beat only (min {MIN_DELTA_PCT_TO_TRUST}% to trust)")
+        log(f"Buy: observed price + ${BUY_CEILING_BUFFER} buffer (no fixed ceiling) | timeout {BUY_TIMEOUT_SEC}s")
+        log(f"Sell: entry + ${PROFIT_MARGIN} | force-exit after {TRADE_AGE_CAP_SECONDS}s unfilled | "
+            f"max {MAX_TRADES_PER_WINDOW} trades/window")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
@@ -273,31 +241,25 @@ class SentimentUpBot:
 
     # ── BUY ──────────────────────────────────────────────────────────────────
 
-    def _attempt_buy(self, token: str, crypto: str) -> dict:
+    def _attempt_buy(self, token: str, observed_price: float, crypto: str) -> dict:
+        ceiling = round(observed_price + BUY_CEILING_BUFFER, 4)
         MIN_SHARES = 5  # CONFIRMED via a real live API error on the other bots in this project
 
         if self.dry_run:
-            deadline = now_unix() + BUY_TIMEOUT_SEC
-            last_seen_price = None
-            while now_unix() < deadline:
-                book = get_order_book(token)
-                price, size = best_ask(book)
-                if price is not None:
-                    last_seen_price = price
-                if price is not None and price <= BUY_CEILING_PRICE:
-                    shares = max(MIN_SHARES, round(self.amount / price))
-                    log(f"[DRY] BUY would fill: ask ${price:.3f} (size {size})", crypto)
-                    return {"result": "bought", "price": price, "shares": shares}
-                time.sleep(0.1)
-            price_info = f"last ask seen ${last_seen_price:.3f}" if last_seen_price is not None else "no asks seen"
-            log(f"[DRY] BUY missed: no ask <= ${BUY_CEILING_PRICE} ({price_info})", crypto)
+            book = get_order_book(token)
+            price, size = best_ask(book)
+            if price is not None and price <= ceiling:
+                shares = max(MIN_SHARES, round(self.amount / price))
+                log(f"[DRY] BUY would fill: ask ${price:.3f} (size {size})", crypto)
+                return {"result": "bought", "price": price, "shares": shares}
+            log(f"[DRY] BUY missed: no ask <= ${ceiling}", crypto)
             return {"result": "missed", "price": None, "shares": 0}
 
         from py_clob_client_v2 import OrderArgsV2, Side, OrderType, OrderPayload
-        size = max(MIN_SHARES, round(self.amount / BUY_CEILING_PRICE))
+        size = max(MIN_SHARES, round(self.amount / ceiling))
         try:
             resp = self.client.create_and_post_order(
-                OrderArgsV2(token_id=token, price=BUY_CEILING_PRICE, size=size, side=Side.BUY),
+                OrderArgsV2(token_id=token, price=ceiling, size=size, side=Side.BUY),
                 order_type=OrderType.GTC,
             )
         except Exception as e:
@@ -337,14 +299,14 @@ class SentimentUpBot:
                 real_balance = float(bal_resp.get("balance", 0)) / 1_000_000
                 if real_balance >= 0.5:
                     log(f"⚠️ get_order() showed no fill, but balance check found {real_balance} shares — correcting course", crypto)
-                    return {"result": "bought", "price": BUY_CEILING_PRICE, "shares": real_balance}
+                    return {"result": "bought", "price": ceiling, "shares": real_balance}
             except Exception as e:
                 log(f"⚠️ Final balance safety-check failed ({e})", crypto)
             log(f"❌ BUY timed out with no confirmed fill after {BUY_TIMEOUT_SEC}s", crypto)
             return {"result": "missed", "price": None, "shares": 0}
 
-        log(f"✅ BUY confirmed: {last_known_size} shares at ceiling ${BUY_CEILING_PRICE}, order {order_id[:16]}...", crypto)
-        return {"result": "bought", "price": BUY_CEILING_PRICE, "shares": last_known_size}
+        log(f"✅ BUY confirmed: {last_known_size} shares at ceiling ${ceiling}, order {order_id[:16]}...", crypto)
+        return {"result": "bought", "price": ceiling, "shares": last_known_size}
 
     # ── SELL ─────────────────────────────────────────────────────────────────
 
@@ -466,73 +428,79 @@ class SentimentUpBot:
 
     # ── WINDOW LOOP ──────────────────────────────────────────────────────────
 
-    def _asset_loop(self, slug_prefix: str):
+    def _monitor_window(self, slug_prefix: str, start_ts: int):
         crypto = MARKETS[slug_prefix]
+        close_ts = start_ts + 300
         symbol = SYMBOLS.get(crypto)
-        while not self.stop_event.is_set():
-            upcoming_start = next_window_start(now_unix())
-            current_window_close_ts = upcoming_start  # the current window closes exactly when the next one opens
-            wake_at = current_window_close_ts - WAKE_BEFORE_SECONDS
 
-            while now_unix() < wake_at and not self.stop_event.is_set():
-                time.sleep(1)
-            if self.stop_event.is_set():
+        market = None
+        find_deadline = now_unix() + 5
+        while now_unix() < find_deadline:
+            market = get_window_market(slug_prefix, start_ts)
+            if market:
                 break
+            time.sleep(0.5)
+        if not market:
+            log(f"Could not find market for window starting {start_ts} — skipping entire window", crypto)
+            return
 
-            log(f"Waking {WAKE_BEFORE_SECONDS}s before window close to analyze — "
-                f"upcoming window starts {datetime.fromtimestamp(upcoming_start, tz=timezone.utc).strftime('%H:%M:%S')} UTC", crypto)
+        window_open_price = get_window_open_price(symbol, start_ts) if symbol else None
+        if window_open_price:
+            log(f"Price to beat this window: ${window_open_price:,.2f}", crypto)
+        else:
+            log("Could not fetch price-to-beat — skipping entire window (no reliable direction signal without it)", crypto)
+            return
 
-            analysis = analyze_pre_window(symbol, current_window_close_ts, self.stop_event, crypto)
-            log(f"Analysis: {analysis['reason']}", crypto)
+        trades_this_window = 0
+        while now_unix() < close_ts and trades_this_window < MAX_TRADES_PER_WINDOW:
+            if self.stop_event.is_set():
+                return
 
-            if not analysis["enter"]:
-                log("Skipping upcoming window — trailing trend did not confirm Up", crypto)
-                self._record({
-                    "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
-                    "slug": f"{slug_prefix}-{upcoming_start}", "consistency_trend": analysis["consistency_trend"],
-                    "entered": False, "buy_result": "skipped", "buy_price": "", "buy_shares": "",
-                    "sell_result": "n/a", "sell_price": "", "pnl_usd": 0, "notes": analysis["reason"],
-                })
-                time.sleep(2)
+            current_btc_price = get_binance_price(symbol) if symbol else None
+            if current_btc_price is None:
+                time.sleep(MONITOR_INTERVAL)
                 continue
 
-            # Confirmed Up — wait for the new window to actually open, then buy immediately
-            while now_unix() < upcoming_start:
-                time.sleep(0.01)
+            delta_value = current_btc_price - window_open_price
+            delta_pct = abs(delta_value) / window_open_price * 100
+            delta_side = "Up" if delta_value > 0 else "Down"
 
-            market = None
-            find_deadline = now_unix() + 3
-            while now_unix() < find_deadline:
-                market = get_window_market(slug_prefix, upcoming_start)
-                if market:
-                    break
-                time.sleep(0.1)
-            if not market:
-                log("Could not find the upcoming market in time — skipping this window", crypto)
-                time.sleep(2)
+            if delta_pct < MIN_DELTA_PCT_TO_TRUST:
+                time.sleep(MONITOR_INTERVAL)
                 continue
 
-            log("Entering Up — trailing consistency confirmed Up", crypto)
-            buy_info = self._attempt_buy(market["up_token"], crypto)
+            token = market["up_token"] if delta_side == "Up" else market["down_token"]
+            book = get_order_book(token)
+            observed_price, _ = best_ask(book)
+            if observed_price is None:
+                time.sleep(MONITOR_INTERVAL)
+                continue
+
+            trades_this_window += 1
+            log(f"Delta signal (trade {trades_this_window}/{MAX_TRADES_PER_WINDOW}): "
+                f"{delta_value:+.2f} ({delta_pct:.4f}%) -> buying {delta_side} @ ~${observed_price}", crypto)
+
+            buy_info = self._attempt_buy(token, observed_price, crypto)
             row = {
                 "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
-                "slug": market["slug"], "consistency_trend": analysis["consistency_trend"],
-                "entered": True, "buy_result": buy_info["result"], "buy_price": buy_info["price"],
-                "buy_shares": buy_info["shares"],
+                "slug": market["slug"], "trade_num_this_window": trades_this_window,
+                "delta_side": delta_side, "delta_value": round(delta_value, 4), "delta_pct": round(delta_pct, 4),
+                "buy_result": buy_info["result"], "buy_price": buy_info["price"], "buy_shares": buy_info["shares"],
             }
+
             if buy_info["result"] != "bought":
                 row.update({"sell_result": "n/a", "sell_price": "", "pnl_usd": 0, "notes": "no buy fill"})
                 self._record(row)
-                time.sleep(2)
+                time.sleep(MONITOR_INTERVAL)
                 continue
 
-            sell_info = self._watch_for_sell(market["up_token"], buy_info["price"], buy_info["shares"], crypto)
+            sell_info = self._watch_for_sell(token, buy_info["price"], buy_info["shares"], crypto)
             row.update({
                 "sell_result": sell_info["result"], "sell_price": sell_info["price"],
                 "pnl_usd": sell_info["pnl_usd"], "notes": sell_info["notes"],
             })
             self._record(row)
-            time.sleep(2)
+            time.sleep(MONITOR_INTERVAL)
 
     def _record(self, row: dict):
         with self.trades_lock:
@@ -540,8 +508,23 @@ class SentimentUpBot:
         self.logger.write(row)
         pnl = row.get("pnl_usd", 0)
         sign = "+" if isinstance(pnl, (int, float)) and pnl >= 0 else ""
-        log(f"RECORDED: entered={row['entered']} | buy={row['buy_result']}@{row['buy_price']} | "
+        log(f"RECORDED: side={row['delta_side']} | buy={row['buy_result']}@{row['buy_price']} | "
             f"sell={row['sell_result']}@{row['sell_price']} | pnl={sign}${pnl}", row["crypto"])
+
+    def _asset_loop(self, slug_prefix: str):
+        crypto = MARKETS[slug_prefix]
+        while not self.stop_event.is_set():
+            start_ts = next_window_start(now_unix())
+            while now_unix() < start_ts and not self.stop_event.is_set():
+                time.sleep(1)
+            if self.stop_event.is_set():
+                break
+            log(f"Monitoring window starting {datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime('%H:%M:%S')} UTC", crypto)
+            try:
+                self._monitor_window(slug_prefix, start_ts)
+            except Exception as e:
+                log(f"⚠️ Unhandled error this window: {e}", crypto)
+            time.sleep(2)
 
     def run(self):
         threads = [threading.Thread(target=self._asset_loop, args=(prefix,), daemon=True) for prefix in MARKETS]
@@ -558,25 +541,23 @@ class SentimentUpBot:
     def _print_summary(self):
         with self.trades_lock:
             trades = list(self.trades)
-        entered = [t for t in trades if t["entered"]]
-        bought  = [t for t in entered if t["buy_result"] == "bought"]
-        sold    = [t for t in bought if t["sell_result"] == "sold"]
+        bought = [t for t in trades if t["buy_result"] == "bought"]
+        sold   = [t for t in bought if t["sell_result"] == "sold"]
         total_pnl = sum(float(t["pnl_usd"] or 0) for t in trades)
         log("-" * 70)
-        log(f"SUMMARY — {len(trades)} windows evaluated, {len(entered)} entered, {len(trades)-len(entered)} skipped")
-        log(f"  Buy fills: {len(bought)}/{len(entered)}")
+        log(f"SUMMARY — {len(trades)} signals, {len(bought)} buy fills")
         log(f"  Sold at margin: {len(sold)}")
         log(f"  Total PnL: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f}")
         log("-" * 70)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Polymarket Sentiment-Gated Up Scalper")
+    parser = argparse.ArgumentParser(description="Polymarket Rapid Momentum Scalper")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--live", action="store_true")
     parser.add_argument("--amount", type=float, default=2.0)
     args = parser.parse_args()
 
-    bot = SentimentUpBot(dry_run=args.dry_run, amount=args.amount)
+    bot = BreakthroughBot(dry_run=args.dry_run, amount=args.amount)
     bot.run()
