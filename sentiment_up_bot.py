@@ -60,6 +60,10 @@ MARKETS = {
 }
 
 MIN_DELTA_PCT_TO_TRUST = 0.01   # same validated starting point from the momentum bot — filters pure noise
+INVERT_SIGNAL = True            # TEST: per explicit request, buy the OPPOSITE of what the delta signal
+                                  # indicates. Original delta logic is fully preserved below — this just
+                                  # flips the final side after the signal is computed. Set to False to
+                                  # revert to the original (non-inverted) behavior with zero other changes.
                                   # (e.g. a $0.01 delta on a $60k+ asset) while still catching real moves.
 BUY_CEILING_BUFFER = 0.02        # willing to pay up to (observed price + this) — NOT a fixed cap, since this
                                   # bot is meant to catch momentum already in progress, which can mean buying
@@ -220,7 +224,8 @@ class BreakthroughBot:
 
         log("=" * 70)
         log(f"Rapid Momentum Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
-        log(f"Direction: delta-from-price-to-beat only (min {MIN_DELTA_PCT_TO_TRUST}% to trust)")
+        log(f"Direction: delta-from-price-to-beat only (min {MIN_DELTA_PCT_TO_TRUST}% to trust)"
+            + (" | ⚠️ INVERT_SIGNAL=True — betting AGAINST the delta signal (test mode)" if INVERT_SIGNAL else ""))
         log(f"Buy: observed price + ${BUY_CEILING_BUFFER} buffer (no fixed ceiling) | timeout {BUY_TIMEOUT_SEC}s")
         log(f"Sell: entry + ${PROFIT_MARGIN} | force-exit after {TRADE_AGE_CAP_SECONDS}s unfilled | "
             f"max {MAX_TRADES_PER_WINDOW} trades/window")
@@ -470,6 +475,10 @@ class BreakthroughBot:
                 time.sleep(MONITOR_INTERVAL)
                 continue
 
+            raw_delta_side = delta_side
+            if INVERT_SIGNAL:
+                delta_side = "Down" if raw_delta_side == "Up" else "Up"
+
             token = market["up_token"] if delta_side == "Up" else market["down_token"]
             book = get_order_book(token)
             observed_price, _ = best_ask(book)
@@ -478,8 +487,9 @@ class BreakthroughBot:
                 continue
 
             trades_this_window += 1
+            invert_note = f" [INVERTED from {raw_delta_side}]" if INVERT_SIGNAL else ""
             log(f"Delta signal (trade {trades_this_window}/{MAX_TRADES_PER_WINDOW}): "
-                f"{delta_value:+.2f} ({delta_pct:.4f}%) -> buying {delta_side} @ ~${observed_price}", crypto)
+                f"{delta_value:+.2f} ({delta_pct:.4f}%) -> buying {delta_side}{invert_note} @ ~${observed_price}", crypto)
 
             buy_info = self._attempt_buy(token, observed_price, crypto)
             row = {
