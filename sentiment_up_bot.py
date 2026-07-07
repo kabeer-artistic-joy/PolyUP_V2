@@ -1,35 +1,26 @@
 #!/usr/bin/env python3
 """
-Polymarket Sentiment-Gated Up Scalper
-========================================
+Polymarket Trailing-Consistency Up Scalper
+============================================
 Always buys UP, same as the original Always-Up bot — but instead of entering
-every single window, it wakes WAKE_BEFORE_SECONDS before the CURRENT window
-closes and runs two checks on the real BTC price to decide whether the
-UPCOMING window is actually worth entering:
+every single window, it wakes CONSISTENCY_WINDOW_SEC before the CURRENT
+window closes and checks one thing: is BTC's price, measured against the
+CURRENT window's own price-to-beat, still trending up in that final
+stretch? If yes, buy Up the instant the new window opens. If not, skip
+this window entirely.
 
-1. MARKET SENTIMENT (first SENTIMENT_WINDOW_SEC of the observation): counts
-   how many times BTC's price, measured against the CURRENT window's own
-   price-to-beat, reverses direction — a "dip" is a local peak followed by a
-   decline, a "surge" is a local trough followed by a rise. If dips clearly
-   outnumber surges (or vice versa) by at least SENTIMENT_MIN_DIFFERENCE,
-   that's read as the market's collective sentiment heading into the new
-   window. If the difference is too small, sentiment is read as uncertain.
-
-2. TRAILING CONSISTENCY (final CONSISTENCY_WINDOW_SEC before window close):
-   checks whether the price is STILL moving up in the final stretch, not
-   reversing right as the new window is about to begin — since a consistent
-   downward move right at the boundary is a real warning sign even if the
-   broader sentiment was Up.
-
-Only enters if BOTH read Up. If either is Down or Uncertain, that window is
-skipped entirely — this bot is not designed to force an entry.
+An earlier version of this bot also used a market-sentiment check (counting
+price reversals over a longer lookback) — that was tested, found not to work
+as intended (its threshold was unreachable given real data), and removed
+entirely per explicit decision. This version tests the trailing consistency
+check on its own.
 
 Buy/sell mechanics are otherwise the same as proven on the other bots:
 target $0.50, ceiling $0.52, resting sell at entry+$0.05, force-exit if
 unfilled 10 seconds after buying.
 
 IMPORTANT — read before running live:
-  This is a genuinely new, untested hypothesis about market sentiment
+  This is a genuinely new, untested hypothesis about a short trailing trend
   predicting the next window's direction. It has NOT been validated with
   real data. Run --dry-run for a meaningful sample before ever using --live.
 
@@ -67,14 +58,12 @@ BUY_TIMEOUT_SEC   = 3.0
 PROFIT_MARGIN     = 0.05   # sell trigger = entry price + this
 TRADE_AGE_CAP_SECONDS = 10  # force-exit if unfilled this many seconds after buying
 
-WAKE_BEFORE_SECONDS     = 60   # start analyzing this many seconds before the CURRENT window closes
-CONSISTENCY_WINDOW_SEC  = 10   # final N seconds of the observation used for the trailing consistency check
-SENTIMENT_WINDOW_SEC    = WAKE_BEFORE_SECONDS - CONSISTENCY_WINDOW_SEC  # the remaining 50s used for dip/surge counting
-SENTIMENT_MIN_DIFFERENCE = 1   # LOWERED from 2 based on real data: across 37 real windows observed, the
-                                 # difference between dips and surges NEVER reached 2 — the max ever seen was 1.
-                                 # A threshold of 2 was mathematically unreachable given how this metric actually
-                                 # behaves, not evidence the bot was being appropriately cautious.
-SAMPLE_INTERVAL_SEC     = 1.0  # how often to sample BTC price during the 60s observation
+# Sentiment/dip-surge analysis removed entirely per explicit decision — it wasn't
+# working as intended (real data showed its threshold was unreachable). Now
+# testing ONLY the trailing consistency check on its own.
+CONSISTENCY_WINDOW_SEC = 10    # observe this many seconds before window close
+WAKE_BEFORE_SECONDS     = CONSISTENCY_WINDOW_SEC  # wake exactly this long before close — nothing else is being measured
+SAMPLE_INTERVAL_SEC     = 1.0  # how often to sample BTC price during the observation
 
 POLL_INTERVAL_SLOW = 1.0
 
@@ -120,40 +109,15 @@ def get_window_open_price(symbol: str, window_ts: int) -> float | None:
         return None
 
 
-def detect_turning_points(samples: list) -> tuple:
-    """
-    samples: list of (timestamp, value) where value = btc_price - price_to_beat.
-    A 'dip' is a local peak followed by a decline (price was rising, then
-    started falling). A 'surge' is a local trough followed by a rise (price
-    was falling, then started rising). Returns (dips, surges) counts.
-    """
-    dips, surges = 0, 0
-    if len(samples) < 3:
-        return dips, surges
-    values = [v for _, v in samples]
-    direction = None
-    for i in range(1, len(values)):
-        if values[i] > values[i - 1]:
-            new_direction = "up"
-        elif values[i] < values[i - 1]:
-            new_direction = "down"
-        else:
-            continue
-        if direction is not None and new_direction != direction:
-            if direction == "up" and new_direction == "down":
-                dips += 1
-            elif direction == "down" and new_direction == "up":
-                surges += 1
-        direction = new_direction
-    return dips, surges
-
-
 def analyze_pre_window(symbol: str, current_window_close_ts: float, stop_event: threading.Event, crypto: str) -> dict:
     """
     Runs during the last WAKE_BEFORE_SECONDS of the CURRENT window, before it
-    closes, to decide whether to buy Up in the UPCOMING window.
+    closes, to decide whether to buy Up in the UPCOMING window. Sentiment/
+    dip-surge analysis was tested and removed per explicit decision — it
+    wasn't working as intended. This now checks ONLY the trailing trend: is
+    BTC still moving up in the final seconds before the window closes.
     """
-    result = {"enter": False, "reason": "", "dips": 0, "surges": 0, "sentiment": None, "consistency_trend": None}
+    result = {"enter": False, "reason": "", "consistency_trend": None}
 
     current_window_start_ts = int(current_window_close_ts) - 300
     price_to_beat = get_window_open_price(symbol, current_window_start_ts)
@@ -171,32 +135,16 @@ def analyze_pre_window(symbol: str, current_window_close_ts: float, stop_event: 
             samples.append((now_unix(), price - price_to_beat))
         time.sleep(SAMPLE_INTERVAL_SEC)
 
-    if len(samples) < 5:
+    if len(samples) < 2:
         result["reason"] = f"insufficient samples collected ({len(samples)}) — skipping"
         return result
 
-    cutoff = current_window_close_ts - CONSISTENCY_WINDOW_SEC
-    sentiment_samples   = [(t, v) for t, v in samples if t < cutoff]
-    consistency_samples = [(t, v) for t, v in samples if t >= cutoff]
+    first_val, last_val = samples[0][1], samples[-1][1]
+    consistency_trend = "Up" if last_val > first_val else ("Down" if last_val < first_val else "Flat")
 
-    dips, surges = detect_turning_points(sentiment_samples)
-    diff = surges - dips
-    if diff >= SENTIMENT_MIN_DIFFERENCE:
-        sentiment = "Up"
-    elif -diff >= SENTIMENT_MIN_DIFFERENCE:
-        sentiment = "Down"
-    else:
-        sentiment = "Uncertain"
-
-    consistency_trend = None
-    if len(consistency_samples) >= 2:
-        first_val, last_val = consistency_samples[0][1], consistency_samples[-1][1]
-        consistency_trend = "Up" if last_val > first_val else ("Down" if last_val < first_val else "Flat")
-
-    result["dips"], result["surges"], result["sentiment"], result["consistency_trend"] = dips, surges, sentiment, consistency_trend
-    result["enter"] = (sentiment == "Up") and (consistency_trend == "Up")
-    result["reason"] = (f"dips={dips} surges={surges} diff={diff:+d} sentiment={sentiment} "
-                         f"| trailing {CONSISTENCY_WINDOW_SEC}s trend={consistency_trend}")
+    result["consistency_trend"] = consistency_trend
+    result["enter"] = (consistency_trend == "Up")
+    result["reason"] = f"trailing {CONSISTENCY_WINDOW_SEC}s trend={consistency_trend} (start {first_val:+.2f}, end {last_val:+.2f})"
     return result
 
 
@@ -265,7 +213,7 @@ def next_window_start(now: float) -> int:
 
 CSV_FIELDS = [
     "timestamp", "bot_name", "mode", "crypto", "slug",
-    "dips", "surges", "sentiment", "consistency_trend", "entered",
+    "consistency_trend", "entered",
     "buy_result", "buy_price", "buy_shares",
     "sell_result", "sell_price", "pnl_usd", "notes",
 ]
@@ -306,9 +254,8 @@ class SentimentUpBot:
         log(f"Sentiment-Gated Up Scalper | {self.mode_str.upper()} | ${amount:.2f}/trade | bot_name={self.bot_name}")
         log(f"Buy: target ${BUY_TARGET_PRICE} ceiling ${BUY_CEILING_PRICE} | Sell: entry + ${PROFIT_MARGIN} | "
             f"force-exit after {TRADE_AGE_CAP_SECONDS}s unfilled")
-        log(f"Pre-window analysis: wake {WAKE_BEFORE_SECONDS}s before close | "
-            f"sentiment window {SENTIMENT_WINDOW_SEC}s | consistency window {CONSISTENCY_WINDOW_SEC}s | "
-            f"min sentiment difference {SENTIMENT_MIN_DIFFERENCE}")
+        log(f"Pre-window analysis: wake {WAKE_BEFORE_SECONDS}s before close | trailing consistency check only "
+            f"(sentiment/dip-surge analysis removed)")
         log(f"Trade log: {self.logger.path}")
         log("=" * 70)
 
@@ -539,11 +486,10 @@ class SentimentUpBot:
             log(f"Analysis: {analysis['reason']}", crypto)
 
             if not analysis["enter"]:
-                log("Skipping upcoming window — sentiment/consistency did not both confirm Up", crypto)
+                log("Skipping upcoming window — trailing trend did not confirm Up", crypto)
                 self._record({
                     "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
-                    "slug": f"{slug_prefix}-{upcoming_start}", "dips": analysis["dips"], "surges": analysis["surges"],
-                    "sentiment": analysis["sentiment"], "consistency_trend": analysis["consistency_trend"],
+                    "slug": f"{slug_prefix}-{upcoming_start}", "consistency_trend": analysis["consistency_trend"],
                     "entered": False, "buy_result": "skipped", "buy_price": "", "buy_shares": "",
                     "sell_result": "n/a", "sell_price": "", "pnl_usd": 0, "notes": analysis["reason"],
                 })
@@ -566,12 +512,11 @@ class SentimentUpBot:
                 time.sleep(2)
                 continue
 
-            log("Entering Up — sentiment and consistency both confirmed", crypto)
+            log("Entering Up — trailing consistency confirmed Up", crypto)
             buy_info = self._attempt_buy(market["up_token"], crypto)
             row = {
                 "timestamp": ts_str(), "bot_name": self.bot_name, "mode": self.mode_str, "crypto": crypto,
-                "slug": market["slug"], "dips": analysis["dips"], "surges": analysis["surges"],
-                "sentiment": analysis["sentiment"], "consistency_trend": analysis["consistency_trend"],
+                "slug": market["slug"], "consistency_trend": analysis["consistency_trend"],
                 "entered": True, "buy_result": buy_info["result"], "buy_price": buy_info["price"],
                 "buy_shares": buy_info["shares"],
             }
