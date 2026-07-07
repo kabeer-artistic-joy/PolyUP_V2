@@ -70,8 +70,10 @@ TRADE_AGE_CAP_SECONDS = 10  # force-exit if unfilled this many seconds after buy
 WAKE_BEFORE_SECONDS     = 60   # start analyzing this many seconds before the CURRENT window closes
 CONSISTENCY_WINDOW_SEC  = 10   # final N seconds of the observation used for the trailing consistency check
 SENTIMENT_WINDOW_SEC    = WAKE_BEFORE_SECONDS - CONSISTENCY_WINDOW_SEC  # the remaining 50s used for dip/surge counting
-SENTIMENT_MIN_DIFFERENCE = 2   # minimum |surges - dips| to be read as confident, not uncertain — a starting
-                                 # hypothesis, not a calibrated number. Needs real data to validate.
+SENTIMENT_MIN_DIFFERENCE = 1   # LOWERED from 2 based on real data: across 37 real windows observed, the
+                                 # difference between dips and surges NEVER reached 2 — the max ever seen was 1.
+                                 # A threshold of 2 was mathematically unreachable given how this metric actually
+                                 # behaves, not evidence the bot was being appropriately cautious.
 SAMPLE_INTERVAL_SEC     = 1.0  # how often to sample BTC price during the 60s observation
 
 POLL_INTERVAL_SLOW = 1.0
