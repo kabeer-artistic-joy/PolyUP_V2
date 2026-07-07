@@ -60,18 +60,18 @@ MARKETS = {
 }
 
 MIN_DELTA_PCT_TO_TRUST = 0.01   # same validated starting point from the momentum bot — filters pure noise
-INVERT_SIGNAL = True            # TEST: per explicit request, buy the OPPOSITE of what the delta signal
-                                  # indicates. Original delta logic is fully preserved below — this just
-                                  # flips the final side after the signal is computed. Set to False to
-                                  # revert to the original (non-inverted) behavior with zero other changes.
+INVERT_SIGNAL = False           # Reverted per explicit request — betting opposite the delta lost too,
+                                  # which is real, useful evidence (see explanation), not a dead end.
                                   # (e.g. a $0.01 delta on a $60k+ asset) while still catching real moves.
 BUY_CEILING_BUFFER = 0.02        # willing to pay up to (observed price + this) — NOT a fixed cap, since this
                                   # bot is meant to catch momentum already in progress, which can mean buying
                                   # at $0.80, not just near $0.50.
 BUY_TIMEOUT_SEC    = 2.0
 
-PROFIT_MARGIN      = 0.02        # thin, fast capture — per explicit request
-TRADE_AGE_CAP_SECONDS = 5        # force-exit if unfilled this many seconds after buying — per explicit request
+PROFIT_MARGIN      = 0.10        # raised from $0.02 — wide enough to clear the bid-ask spread that was
+                                    # eating the thin margin regardless of direction
+TRADE_AGE_CAP_SECONDS = 20        # raised from 5s — gives real momentum more time to develop before forcing
+                                    # an exit at whatever the spread happens to be at that instant
 
 MAX_TRADES_PER_WINDOW = 8        # raised from 6 per explicit request
 MONITOR_INTERVAL      = 1.0      # how often to check for a new entry opportunity throughout the window
