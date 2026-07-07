@@ -69,7 +69,7 @@ BUY_TIMEOUT_SEC    = 2.0
 PROFIT_MARGIN      = 0.02        # thin, fast capture — per explicit request
 TRADE_AGE_CAP_SECONDS = 5        # force-exit if unfilled this many seconds after buying — per explicit request
 
-MAX_TRADES_PER_WINDOW = 6        # per explicit request (2-6 range, using the upper bound)
+MAX_TRADES_PER_WINDOW = 8        # raised from 6 per explicit request
 MONITOR_INTERVAL      = 1.0      # how often to check for a new entry opportunity throughout the window
 
 POLL_INTERVAL_SLOW = 0.5
@@ -183,7 +183,7 @@ CSV_FIELDS = [
     "timestamp", "bot_name", "mode", "crypto", "slug", "trade_num_this_window",
     "delta_side", "delta_value", "delta_pct",
     "buy_result", "buy_price", "buy_shares", "buy_elapsed_ms",
-    "sell_result", "sell_price", "pnl_usd", "notes",
+    "sell_result", "sell_price", "seconds_to_sell", "pnl_usd", "notes",
 ]
 
 class TradeLogger:
@@ -387,15 +387,16 @@ class BreakthroughBot:
             book = get_order_book(token)
             price, size = best_bid(book)
             if price is not None and price >= sell_trigger and size >= shares:
-                log(f"[DRY] SELL would fill: bid ${price:.3f}", crypto)
+                elapsed = round(now_unix() - buy_time, 1)
+                log(f"[DRY] SELL would fill: bid ${price:.3f} at {elapsed}s", crypto)
                 pnl = round((price - buy_price) * shares, 4)
-                return {"result": "sold", "price": price, "pnl_usd": pnl, "notes": "sold"}
+                return {"result": "sold", "price": price, "pnl_usd": pnl, "notes": "sold", "seconds_to_sell": elapsed}
             time.sleep(POLL_INTERVAL_SLOW)
 
         log(f"⏰ {TRADE_AGE_CAP_SECONDS}s unfilled — force-exiting at best price", crypto)
         exit_result = self._force_exit(token, shares, crypto)
         pnl = round((exit_result["price"] - buy_price) * shares, 4) if exit_result["price"] is not None else -round(buy_price * shares, 4)
-        return {**exit_result, "pnl_usd": pnl, "notes": "force-exit"}
+        return {**exit_result, "pnl_usd": pnl, "notes": "force-exit", "seconds_to_sell": TRADE_AGE_CAP_SECONDS}
 
     def _force_exit(self, token: str, shares: float, crypto: str) -> dict:
         if self.dry_run:
@@ -497,6 +498,7 @@ class BreakthroughBot:
             sell_info = self._watch_for_sell(token, buy_info["price"], buy_info["shares"], crypto)
             row.update({
                 "sell_result": sell_info["result"], "sell_price": sell_info["price"],
+                "seconds_to_sell": sell_info.get("seconds_to_sell", ""),
                 "pnl_usd": sell_info["pnl_usd"], "notes": sell_info["notes"],
             })
             self._record(row)
